@@ -202,10 +202,10 @@ fn main() -> io::Result<()> {
             println!("Path {} doesn't exist", s);
             continue;
         }
-        let fd = File::open(Path::new(s)).unwrap();
-        let mut dev = Device::new().unwrap();
-        poll.registry().register(&mut SourceFd(&fd.as_raw_fd()), Token(i), Interest::READABLE)?;
-        dev.set_fd(fd)?;
+        let file = File::open(Path::new(s)).unwrap();
+        let uninit_dev = UninitDevice::new().unwrap();
+        poll.registry().register(&mut SourceFd(&file.as_raw_fd()), Token(i), Interest::READABLE)?;
+        let dev = uninit_dev.set_file(file).unwrap();
         devs.push(dev);
         println!("Added {}", s);
         i += 1;
@@ -213,9 +213,9 @@ fn main() -> io::Result<()> {
 
     loop {
         poll.poll(&mut events, None)?;
-
         for event in events.iter() {
-            let dev = &mut devs[event.token().0];
+            let devid = event.token().0;
+            let dev = &mut devs[devid];
             while dev.has_event_pending() {
                 let e = dev.next_event(evdev_rs::ReadFlag::NORMAL);
                 match e {
@@ -235,7 +235,16 @@ fn main() -> io::Result<()> {
                         }
                         process_event2(&dev, &ev, selectkey)
                     },
-                    _ => ()
+                    Err(e) => {
+                        if e.raw_os_error() == Some(19) // ENODEV
+                        || e.raw_os_error() == Some(9) // EBADF
+                        || e.kind() == io::ErrorKind::NotFound {
+                            let file = dev.file();
+                            let _ = poll.registry().deregister(&mut SourceFd(&file.as_raw_fd()));
+                            eprintln!("Deregistered dev {}, because of Err {}.",devid,e);
+                            break;
+                        }
+                    }
                 }
             }
         }
