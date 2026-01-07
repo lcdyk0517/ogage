@@ -136,6 +136,16 @@ fn process_event(
         return;
     }
 
+    // -------- KEY_POWER：单击息屏（不参与 repeat）--------
+    if ev.event_code == EventCode::EV_KEY(EV_KEY::KEY_POWER) && pressed {
+        // 防止其它 repeat 还在跑
+        repeat_action.store(RepeatAction::None as u8, Ordering::Relaxed);
+        repeat_active.store(false, Ordering::Relaxed);
+
+        let _ = Command::new("pause.sh").spawn();
+        return;
+    }
+
     // -------- hotkey + DPAD：线程连发 --------
     if hotkey && ev.value == 1 {
         if ev.event_code == k.bright_up {
