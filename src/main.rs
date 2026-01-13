@@ -123,6 +123,16 @@ fn process_event(
 ) {
     let pressed = ev.value == 1 || ev.value == 2;
 
+    // -------- 耳机插拔：切换播放路径 --------
+    if ev.event_code == EventCode::EV_SW(EV_SW::SW_HEADPHONE_INSERT) {
+        // value=0 插入耳机 -> HP；value=1 拔出 -> SPK
+        let dest = if ev.value == 0 { "HP" } else { "SPK" };
+        let _ = Command::new("amixer")
+            .args(&["-q", "sset", "Playback Path", dest])
+            .spawn();
+        return;
+    }
+
     // -------- 单独音量键：使用内核 autorepeat --------
     if ev.event_code == k.volume_up && pressed {
         let _ = Command::new("amixer")
