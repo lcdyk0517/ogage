@@ -123,6 +123,19 @@ fn process_event(
 ) {
     let pressed = ev.value == 1 || ev.value == 2;
 
+    // -------- hotkey + KEY_POWER：关机/结束脚本 --------
+    if hotkey
+        && ev.event_code == EventCode::EV_KEY(EV_KEY::KEY_POWER)
+        && pressed
+    {
+        // 确保不会有残留 repeat
+        repeat_action.store(RepeatAction::None as u8, Ordering::Relaxed);
+        repeat_active.store(false, Ordering::Relaxed);
+
+        let _ = Command::new("finish.sh").spawn();
+        return;
+    }
+
     // -------- 耳机插拔：切换播放路径 --------
     if ev.event_code == EventCode::EV_SW(EV_SW::SW_HEADPHONE_INSERT) {
         // value=0 插入耳机 -> HP；value=1 拔出 -> SPK
@@ -134,12 +147,12 @@ fn process_event(
     }
 
     // -------- 单独音量键：使用内核 autorepeat --------
-    if ev.event_code == k.volume_up && pressed {
+    if !hotkey && ev.event_code == k.volume_up && pressed {
         let _ = Command::new("amixer")
             .args(&["-q", "sset", "Playback", "1%+"])
             .spawn();
         return;
-    } else if ev.event_code == k.volume_down && pressed {
+    } else if !hotkey && ev.event_code == k.volume_down && pressed {
         let _ = Command::new("amixer")
             .args(&["-q", "sset", "Playback", "1%-"])
             .spawn();
@@ -158,6 +171,14 @@ fn process_event(
 
     // -------- hotkey + DPAD：线程连发 --------
     if hotkey && ev.value == 1 {
+        // hotkey + 音量键：改为调亮度（连发线程）
+        if ev.event_code == k.volume_up {
+            repeat_action.store(RepeatAction::BrightUp as u8, Ordering::Relaxed);
+            repeat_active.store(true, Ordering::Relaxed);
+        } else if ev.event_code == k.volume_down {
+            repeat_action.store(RepeatAction::BrightDown as u8, Ordering::Relaxed);
+            repeat_active.store(true, Ordering::Relaxed);
+        }
         if ev.event_code == k.bright_up {
             repeat_action.store(RepeatAction::BrightUp as u8, Ordering::Relaxed);
             repeat_active.store(true, Ordering::Relaxed);
@@ -177,6 +198,8 @@ fn process_event(
     if ev.value == 0 {
         if ev.event_code == k.bright_up
             || ev.event_code == k.bright_down
+            || ev.event_code == k.volume_up
+            || ev.event_code == k.volume_down
             || ev.event_code == k.vol_up
             || ev.event_code == k.vol_down
         {
