@@ -14,6 +14,23 @@ use mio::unix::SourceFd;
 // ---------------- 新增：最小配置支持 ----------------
 use std::collections::HashMap;
 
+// ---------------- 新增：最小连发支持（不改原有逻辑） ----------------
+use std::sync::{
+    Arc,
+    atomic::{AtomicU8, AtomicBool, Ordering},
+};
+use std::thread;
+use std::time::Duration;
+
+#[derive(Clone, Copy, PartialEq)]
+enum RepeatAction {
+    None = 0,
+    BrightUp,
+    BrightDown,
+    VolUp,
+    VolDown,
+}
+
 struct Keys {
     hotkey:         EventCode,
     bright_up:      EventCode,
@@ -36,10 +53,10 @@ fn default_keys() -> Keys {
         bright_down:  EventCode::EV_KEY(EV_KEY::BTN_DPAD_DOWN),
         vol_up:       EventCode::EV_KEY(EV_KEY::BTN_DPAD_RIGHT),
         vol_down:     EventCode::EV_KEY(EV_KEY::BTN_DPAD_LEFT),
-        vol_up2:      EventCode::EV_KEY(EV_KEY::BTN_TR),
-        vol_down2:    EventCode::EV_KEY(EV_KEY::BTN_TL),
-        bright_down2: EventCode::EV_KEY(EV_KEY::BTN_TRIGGER_HAPPY3),
-        bright_up2:   EventCode::EV_KEY(EV_KEY::BTN_TRIGGER_HAPPY4),
+        vol_up2:      EventCode::EV_KEY(EV_KEY::KEY_RESERVED),
+        vol_down2:    EventCode::EV_KEY(EV_KEY::KEY_RESERVED),
+        bright_down2: EventCode::EV_KEY(EV_KEY::KEY_RESERVED),
+        bright_up2:   EventCode::EV_KEY(EV_KEY::KEY_RESERVED),
         volume_up:    EventCode::EV_KEY(EV_KEY::KEY_VOLUMEUP),
         volume_down:  EventCode::EV_KEY(EV_KEY::KEY_VOLUMEDOWN),
         mute:         EventCode::EV_KEY(EV_KEY::KEY_PLAYPAUSE),
@@ -142,22 +159,39 @@ fn load_keys_from_conf(path: &str) -> Keys {
 }
 // ---------------- 最小配置支持到此为止 ----------------
 
-fn process_event(_dev: &Device, ev: &InputEvent, hotkey: bool, k: &Keys) {
+fn process_event(
+    _dev: &Device,
+    ev: &InputEvent,
+    hotkey: bool,
+    k: &Keys,
+    repeat_action: &Arc<AtomicU8>,
+    repeat_active: &Arc<AtomicBool>,
+) {
     if hotkey && ev.value == 1 {
         if ev.event_code == k.bright_up || ev.event_code == k.bright_up2 {
             Command::new("brightnessctl").args(&["s","+2%"]).output().expect("Failed to execute brightnessctl");
+            repeat_action.store(RepeatAction::BrightUp as u8, Ordering::Relaxed);
+            repeat_active.store(true, Ordering::Relaxed);
         }
         else if ev.event_code == k.bright_down || ev.event_code == k.bright_down2 {
             Command::new("brightnessctl").args(&["-n","s","2%-"]).output().expect("Failed to execute brightnessctl");
+            repeat_action.store(RepeatAction::BrightDown as u8, Ordering::Relaxed);
+            repeat_active.store(true, Ordering::Relaxed);
         }
         else if ev.event_code == k.vol_up || ev.event_code == k.vol_up2 {
             Command::new("amixer").args(&["-q", "sset", "Playback", "1%+"]).output().expect("Failed to execute amixer");
+            repeat_action.store(RepeatAction::VolUp as u8, Ordering::Relaxed);
+            repeat_active.store(true, Ordering::Relaxed);
         }
         else if ev.event_code == k.vol_down || ev.event_code == k.vol_down2 {
             Command::new("amixer").args(&["-q", "sset", "Playback", "1%-"]).output().expect("Failed to execute amixer");
+            repeat_action.store(RepeatAction::VolDown as u8, Ordering::Relaxed);
+            repeat_active.store(true, Ordering::Relaxed);
         }
         else if ev.event_code == EventCode::EV_KEY(EV_KEY::KEY_POWER) && ev.value > 0 {
             Command::new("finish.sh").spawn().ok().expect("Failed to execute shutdown process");
+            repeat_action.store(RepeatAction::None as u8, Ordering::Relaxed);
+            repeat_active.store(false, Ordering::Relaxed);
         }
     }
     else if ev.event_code == EventCode::EV_SW(EV_SW::SW_HEADPHONE_INSERT) {
@@ -165,6 +199,8 @@ fn process_event(_dev: &Device, ev: &InputEvent, hotkey: bool, k: &Keys) {
         Command::new("amixer").args(&["-q", "sset", "'Playback Path'", dest]).output().expect("Failed to execute amixer");
     }
     else if ev.event_code == EventCode::EV_KEY(EV_KEY::KEY_POWER) && ev.value == 1 {
+        repeat_action.store(RepeatAction::None as u8, Ordering::Relaxed);
+        repeat_active.store(false, Ordering::Relaxed);
         Command::new("pause.sh").spawn().ok().expect("Failed to execute suspend process");
     }
     else if ev.event_code == k.volume_up  && ev.value > 0 {
@@ -175,6 +211,22 @@ fn process_event(_dev: &Device, ev: &InputEvent, hotkey: bool, k: &Keys) {
     }
     else if ev.event_code == k.mute && ev.value > 0 {
         Command::new("mute_toggle.sh").output().expect("Failed to execute amixer");
+    }
+    // 松手：停止连发（不改变原事件处理链，只追加）
+    if ev.value == 0 {
+        let code = &ev.event_code;
+        if *code == k.bright_up
+            || *code == k.bright_up2
+            || *code == k.bright_down
+            || *code == k.bright_down2
+            || *code == k.vol_up
+            || *code == k.vol_up2
+            || *code == k.vol_down
+            || *code == k.vol_down2
+        {
+            repeat_action.store(RepeatAction::None as u8, Ordering::Relaxed);
+            repeat_active.store(false, Ordering::Relaxed);
+        }
     }
 }
 
@@ -195,6 +247,38 @@ fn main() -> io::Result<()> {
     let mut devs: Vec<Device> = Vec::new();
     let mut hotkey = false;
     let mut selectkey = false;
+
+    // -------- 最小连发线程：每 120ms 执行一次（不会删原逻辑） --------
+    let repeat_action = Arc::new(AtomicU8::new(RepeatAction::None as u8));
+    let repeat_active = Arc::new(AtomicBool::new(false));
+    {
+        let repeat_action = repeat_action.clone();
+        let repeat_active = repeat_active.clone();
+        thread::spawn(move || {
+            loop {
+                if repeat_active.load(Ordering::Relaxed) {
+                    let act_u8 = repeat_action.load(Ordering::Relaxed);
+                    let act = unsafe { std::mem::transmute::<u8, RepeatAction>(act_u8) };
+                    match act {
+                        RepeatAction::BrightUp => {
+                            let _ = Command::new("brightnessctl").args(&["s", "+2%"]).output();
+                        }
+                        RepeatAction::BrightDown => {
+                            let _ = Command::new("brightnessctl").args(&["-n", "s", "2%-"]).output();
+                        }
+                        RepeatAction::VolUp => {
+                            let _ = Command::new("amixer").args(&["-q", "sset", "Playback", "1%+"]).output();
+                        }
+                        RepeatAction::VolDown => {
+                            let _ = Command::new("amixer").args(&["-q", "sset", "Playback", "1%-"]).output();
+                        }
+                        RepeatAction::None => {}
+                    }
+                }
+                thread::sleep(Duration::from_millis(120));
+            }
+        });
+    }
 
     let mut i = 0;
     for s in ["/dev/input/event10", "/dev/input/event9", "/dev/input/event8", "/dev/input/event7", "/dev/input/event6", "/dev/input/event5", "/dev/input/event4", "/dev/input/event3", "/dev/input/event2", "/dev/input/event1", "/dev/input/event0"].iter() {
@@ -226,8 +310,13 @@ fn main() -> io::Result<()> {
                             hotkey = ev.value == 1;
                             // let grab = if hotkey { GrabMode::Grab } else { GrabMode::Ungrab };
                             // dev.grab(grab)?;
+                            // hotkey 松开时，确保停连发
+                            if !hotkey {
+                                repeat_action.store(RepeatAction::None as u8, Ordering::Relaxed);
+                                repeat_active.store(false, Ordering::Relaxed);
+                            }
                         }
-                        process_event(&dev, &ev, hotkey, &keys);
+                        process_event(&dev, &ev, hotkey, &keys, &repeat_action, &repeat_active);
 
                         // selectkey 保持原逻辑（你若想也改成可配置，可仿照 hotkey）
                         if ev.event_code == EventCode::EV_KEY(EV_KEY::BTN_TRIGGER_HAPPY1) {
